@@ -445,7 +445,9 @@ if __name__ == "__main__":
         app,
         host="0.0.0.0",
         port=port
-    )        raise RuntimeError("No video file was produced.")
+    )
+
+raise RuntimeError("No video file was produced.")
 
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
