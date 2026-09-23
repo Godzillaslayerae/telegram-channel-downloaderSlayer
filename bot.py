@@ -1,71 +1,39 @@
-import asyncio
-import logging
-import mimetypes
 import os
 import re
-import secrets
-import shutil
+import asyncio
 import tempfile
-from contextlib import asynccontextmanager
+import shutil
 from pathlib import Path
 
 import httpx
 import yt_dlp
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request, HTTPException
+
+TOKEN = os.getenv("BOT_TOKEN")
+PORT = int(os.getenv("PORT", "10000"))
+PUBLIC_URL = os.getenv("RENDER_EXTERNAL_URL")
+
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing")
+
+if not PUBLIC_URL:
+    raise RuntimeError("Render URL is missing")
+
+API = f"https://api.telegram.org/bot{TOKEN}"
+WEBHOOK = "/telegram"
+SECRET = "telegram-secret-123"
+
+app = FastAPI()
+client = httpx.AsyncClient(timeout=180)
+lock = asyncio.Lock()
+
+URL_PATTERN = re.compile(r"https?://[^\s<>\"]+", re.I)
 
 
-# =========================
-# SETTINGS
-# =========================
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable is missing")
-
-MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "49"))
-
-# Render automatically provides this for Web Services.
-PUBLIC_URL = (
-    os.getenv("RENDER_EXTERNAL_URL")
-    or os.getenv("PUBLIC_URL")
-)
-
-WEBHOOK_PATH = "/telegram/webhook"
-
-# Generate a secret automatically.
-WEBHOOK_SECRET = secrets.token_urlsafe(32)
-
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
-URL_REGEX = re.compile(
-    r"https?://[^\s<>\"]+",
-    re.IGNORECASE
-)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-
-log = logging.getLogger("telegram-bot")
-
-http_client = None
-
-# Only process one download at a time.
-download_lock = asyncio.Semaphore(1)
-
-
-# =========================
-# TELEGRAM API
-# =========================
-
-async def telegram_call(method, data=None, files=None):
-    global http_client
-
-    response = await http_client.post(
-        f"{TELEGRAM_API}/{method}",
+async def telegram(method, data=None, files=None):
+    response = await client.post(
+        f"{API}/{method}",
         data=data,
         files=files
     )
@@ -74,39 +42,190 @@ async def telegram_call(method, data=None, files=None):
 
     result = response.json()
 
-    if not result.get("ok"):
-        raise RuntimeError(
-            f"Telegram API error: {result}"
+    if not result["ok"]:
+        raise RuntimeError(result)
+
+    return result["result"]
+
+
+def find_url(message):
+    text = message.get("text") or message.get("caption") or ""
+
+    match = URL_PATTERN.search(text)
+
+    if match:
+        return match.group(0).rstrip(".,!?)]}")
+
+    return None
+
+
+def download_video(url, folder):
+    output = str(
+        Path(folder) / "%(title).70s-%(id)s.%(ext)s"
+    )
+
+    options = {
+        "format": "best[ext=mp4]/best",
+        "outtmpl": output,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "retries": 3,
+    }
+
+    with yt_dlp.YoutubeDL(options) as ydl:
+        ydl.download([url])
+
+    videos = []
+
+    for file in Path(folder).iterdir():
+        if file.is_file() and not file.name.endswith(
+            (".part", ".json", ".jpg", ".jpeg", ".png", ".webp")
+        ):
+            videos.append(file)
+
+    if not videos:
+        raise RuntimeError("No video was downloaded")
+
+    return max(videos, key=lambda x: x.stat().st_size)
+
+
+async def send_video(chat_id, video):
+    if video.stat().st_size > 49 * 1024 * 1024:
+        raise RuntimeError("Video is larger than 49 MB")
+
+    with open(video, "rb") as file:
+        await telegram(
+            "sendVideo",
+            data={
+                "chat_id": str(chat_id),
+                "supports_streaming": "true"
+            },
+            files={
+                "video": (
+                    video.name,
+                    file,
+                    "video/mp4"
+                )
+            }
         )
 
-    return result.get("result")
+
+async def delete_message(chat_id, message_id):
+    await telegram(
+        "deleteMessage",
+        data={
+            "chat_id": str(chat_id),
+            "message_id": str(message_id)
+        }
+    )
 
 
-async def setup_webhook():
-    if not PUBLIC_URL:
-        log.error(
-            "PUBLIC_URL / RENDER_EXTERNAL_URL is missing. "
-            "Webhook cannot be configured."
-        )
+async def process(message):
+    url = find_url(message)
+
+    if not url:
         return
 
-    webhook_url = PUBLIC_URL.rstrip("/") + WEBHOOK_PATH
+    chat_id = message["chat"]["id"]
+    message_id = message["message_id"]
 
-    log.info("Setting Telegram webhook: %s", webhook_url)
+    async with lock:
 
-    for attempt in range(1, 6):
+        folder = tempfile.mkdtemp()
+
         try:
-            result = await telegram_call(
-                "setWebhook",
-                data={
-                    "url": webhook_url,
-                    "allowed_updates": '["channel_post"]',
-                    "drop_pending_updates": "true",
-                    "secret_token": WEBHOOK_SECRET,
-                },
+            print("Downloading:", url)
+
+            video = await asyncio.to_thread(
+                download_video,
+                url,
+                folder
             )
 
-            log.info(
+            print("Uploading:", video.name)
+
+            await send_video(
+                chat_id,
+                video
+            )
+
+            await delete_message(
+                chat_id,
+                message_id
+            )
+
+            print("Done")
+
+        except Exception as error:
+            print("ERROR:", error)
+
+        finally:
+            shutil.rmtree(
+                folder,
+                ignore_errors=True
+            )
+
+
+@app.on_event("startup")
+async def startup():
+    webhook_url = (
+        PUBLIC_URL.rstrip("/")
+        + WEBHOOK
+    )
+
+    await telegram(
+        "setWebhook",
+        data={
+            "url": webhook_url,
+            "allowed_updates": '["channel_post"]',
+            "drop_pending_updates": "true",
+            "secret_token": SECRET
+        }
+    )
+
+    print("Webhook connected")
+    print("Bot is online")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    await client.aclose()
+
+
+@app.get("/")
+async def home():
+    return {"status": "online"}
+
+
+@app.post(WEBHOOK)
+async def webhook(request: Request):
+
+    secret = request.headers.get(
+        "X-Telegram-Bot-Api-Secret-Token"
+    )
+
+    if secret != SECRET:
+        raise HTTPException(
+            status_code=403
+        )
+
+    update = await request.json()
+
+    if "channel_post" in update:
+        asyncio.create_task(
+            process(update["channel_post"])
+        )
+
+    return {"ok": True}
+
+
+if __name__ == "__main__":
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=PORT
+    )            log.info(
                 "Webhook configured successfully: %s",
                 result
             )
